@@ -6,6 +6,7 @@ import torch.nn.utils.prune as prune
 #import pandas as pd
 import numpy as np
 import logging
+from copy import deepcopy
 import csv
 from time import localtime, strftime
 import argparse
@@ -16,18 +17,15 @@ import torchvision
 import torchvision.transforms as transforms
 from itertools import zip_longest
 from torch.optim.lr_scheduler import MultiStepLR, StepLR
+from torch.optim.lr_scheduler import StepLR, MultiStepLR
 import resnet as models
-import os
+import pandas as pd
 
 
-from perforatedai import pb_network as PN
+from perforatedai2 import pb_network as PN
 from perforatedai import pb_globals as PBG
 from perforatedai import pb_models as PBM
 
-
-random_seed=42
-seed = 1787
-pruningTimes = 4
 
 class Network():
 
@@ -53,9 +51,7 @@ class Network():
 
 def prune_filters(indices):
       conv_layer=0
-      print("The length of indices is ", len(indices))
-      for i in indices:
-         print(len(i))
+      
       for layer_name, layer_module in model.named_modules():
 
         if(isinstance(layer_module, th.nn.Conv2d) and not layer_name.startswith('conv1')):
@@ -138,95 +134,108 @@ def evaluate(model, valid_loader, criterion):
     accuracy = 100 * correct / total
     return loss, accuracy
 
-def check_pruning(model):
-  print("\nLayer and filter sizes \n ------------------------------------")
-  for name,module in model.named_modules():
-    if isinstance(module,nn.Conv2d):
-      print(f"Layer: {name}, Filter Size: {module.out_channels}")
-
-def print_remaining_filters(model):
-   print("\nThe filters are \n -----------------------------------")
-   for name,module in model.named_modules():
-      if isinstance(module,nn.Conv2d):
-         print(f"{name} has {module.out_channels} remaining filters")
-
-def print_conv_layer_shapes(model):
-    print("\nLayer and shape of the filters \n -----------------------------")
-    for name, module in model.named_modules():
-        if isinstance(module, nn.Conv2d):
-            print(f"Conv layer: {name}, Weight shape: {module.weight.shape}  Bias shape: {module.bias.shape if module.bias is not None else 'No bias'}")
-
-def calculate_regularization_loss(model):
-    regularization_loss = 0
-    for name, layer in model.named_children():
-        if isinstance(layer, nn.Conv2d):
-            filters = layer.weight
-            for filter in filters:
-                l2_norm = torch.norm(filter, p=2)
-                regularization_loss += l2_norm
-    return regularization_loss
-
 def custom_loss(outputs, labels, model, criterion, lambda_l1=0.0000001):
     lambda_l1 = 0.00001
     l1_norm = 0
     for param in model.parameters():
         l1_norm += torch.sum(torch.abs(param))
-    # print("L1 NORM here for model is: ", l1_norm)
-    # Cross-entropy loss
     ce_loss = criterion(outputs, labels)
-    # print("The cross entropy loss here is: ", ce_loss)
-    # Total loss with L1 regularization
     total_loss = ce_loss + lambda_l1 * l1_norm
-    # print("The addition to the cross entropy is: ", lambda_l1*l1_norm)
-    # print("The total with the regularizer is: ", total_loss)
     return total_loss
 
-
-def print_loss_and_custom_loss(outputs, labels, model, criterion, lambda_l1,epoch):
-
-    l1_norm = 0
+def calculate_parameters(model):
+    total_params = 0
     for param in model.parameters():
-        l1_norm += torch.sum(torch.abs(param))
-    # Cross-entropy loss
-    ce_loss = criterion(outputs, labels)
-    # Total loss with L1 regularization
-    total_loss = ce_loss - lambda_l1 * l1_norm
+        total_params += param.numel()
+    return total_params
 
-    print(f"\n\nThe l1 norm as loss : {l1_norm}")
-
-    print(f"Cross entropy loss : {ce_loss}")
-
-    print(f"Regularisation loss : (lambda_l1*l1_norm) {lambda_l1*l1_norm}")
-
-    print(f"Total loss : (ce_loss-lambda_l1*l1_norm) {total_loss}")
-
-    writer.add_scalar('Loss/L1_norm', l1_norm, epoch)
-    writer.add_scalar('Loss/Cross_entropy', ce_loss, epoch)
-    writer.add_scalar('Loss/Regularisation', lambda_l1 * l1_norm, epoch)
-    writer.add_scalar('Loss/Total', total_loss, epoch)
-    return total_loss
-
-
-def calculate_l1_norm(model):
-    l1_norm = 0.0
+def calculate_trainable_parameters(model):
+    trainable_params = 0
     for param in model.parameters():
-        l1_norm += torch.sum(torch.abs(param))
-    return l1_norm.item()
+        if param.requires_grad:
+          trainable_params += param.numel()
+    return trainable_params
 
 
-#tr_size = 300
-#te_size=300
-#short=True
+def train(model):
+    global pruningTimes
+    ended_epoch=0
+    best_test_acc= 0.0
+    optimizer = th.optim.SGD(model.parameters(), lr=optim_lr,momentum=0.9)
+    scheduler = MultiStepLR(optimizer, milestones=milestones_array, gamma=0.1)
+    c_epochs=0
+    best_val_acc = 0
+    best_train_acc = 0
+    best_state_dict = None
+
+    for c_epochs in range(200):
+      model.train()
+      train_acc = []
+      total_train_loss = 0.0
+
+      for batch_num, (inputs, targets) in enumerate(train_loader):
+        optimizer.zero_grad()
+        inputs, targets = inputs.cuda(), targets.cuda()
+        output = model(inputs)
+        loss = custom_loss(output, targets, model, criterion, lambda_l1=0.00001)
+        loss.backward()
+        optimizer.step()
+        # accumulate train loss
+        total_train_loss += loss.item()
+
+        with torch.no_grad():
+          y_hat = torch.argmax(output, 1)
+          score = torch.eq(y_hat, targets).sum()
+          train_acc.append(score.item())
+          
+      with torch.no_grad():
+        epoch_train_acc = (sum(train_acc) * 100) / tr_size
+        val_loss, val_acc = evaluate(model, val_loader, criterion)
+        epoch_train_loss = total_train_loss / len(train_loader)  
+      
+        if val_acc > best_val_acc:
+            best_val_acc = val_acc
+            best_train_acc = epoch_train_acc
+            best_state_dict = deepcopy(model.state_dict())
+        print('\n--- Epoch: {} | Train acc: {:.2f}% | Train loss: {:.4f} | Val acc: {:.2f}% | Val loss: {:.4f}'
+            .format(c_epochs, epoch_train_acc, epoch_train_loss, val_acc, val_loss))
+          
+        scheduler.step()
+    print(f"Best Validation Accuracy for pruning iteration {pruningTimes} is: ", best_val_acc)
+    model.load_state_dict(best_state_dict)
+    test_loss, test_acc = evaluate(model, test_loader, criterion)
+    print("Final Test Loss: {:.4f} | Final Test Accuracy: {:.2f}%".format(test_loss, test_acc))
+    train_loss, train_acc = evaluate(model, train_loader, criterion)
+    val_loss, val_acc     = evaluate(model, val_loader, criterion)
+    param_count = calculate_parameters(model)
+    trainable_param_count = calculate_trainable_parameters(model)
+    new_row = {
+        "Pruning Iteration": pruningTimes,
+        "Train Acc": train_acc,
+        "Val Acc": val_acc,
+        "Test Acc": test_acc,
+        "Train Loss": train_loss,
+        "Val Loss": val_loss,
+        "Test Loss": test_loss,
+        "Param Count": param_count,
+        "Trainable Param Count": trainable_param_count
+    }
+    df_existing = pd.read_excel(excel_path)
+    df_existing = pd.concat([df_existing, pd.DataFrame([new_row])], ignore_index=True)
+    df_existing.to_excel(excel_path, index=False)
+    torch.save(model, f"modelsTrained2_1/{pruningTimes}_pruned_model.pth")
+    ended_epoch += c_epochs + 1
+    pruningTimes += 1
+
+    return model
+
 def main(model):    
   global pruningTimes
-  lamda=0.001
   prunes=0
   continue_pruning=True
   ended_epoch=0
   best_train_acc=0
   best_test_acc=0
-
-
   decision=True
   best_test_acc= 0.0
   while(continue_pruning==True):
@@ -236,7 +245,6 @@ def main(model):
       
       with th.no_grad():
 
-        #_______________________COMPUTE L1NORM____________________________________
         l1norm=[]
         l_num=0
         for layer_name, layer_module in model.named_modules():
@@ -250,16 +258,10 @@ def main(model):
 
                 l1norm.append(temp)
                 l_num+=1
-                print(layer_name)
+                # print(layer_name)
 
         layer_bounds1=l1norm
-        
-        
-        
-        
 
-  #______Selecting__filters__to__regularize_____
-      print("Length of layer bounds ",len(layer_bounds1))
       inc_indices=[]
       for i in range(len(layer_bounds1)):
           imp_indices=get_indices_bottomk(layer_bounds1[i],i,prune_limits[i])
@@ -287,7 +289,6 @@ def main(model):
         remaining_indices.append(temp)
 
       with th.no_grad():
-        #_______________________COMPUTE L1NORM____________________________________
 
         l1norm=[]
         l_num=0
@@ -312,7 +313,6 @@ def main(model):
         else:
           break
 
-        #_________________________PRUNING_EACH_CONV_LAYER__________________________
         for i in range(len(layer_bounds1)):
             if(a[i].weight.shape[0]<= prune_limits[i]):
               decision_count[:]=0
@@ -323,141 +323,91 @@ def main(model):
       
       if(continue_pruning==False):
         lamda=0
-  #______________________Custom_Regularize the model___________________________
       if(continue_pruning==True):
-        optimizer = th.optim.SGD(model.parameters(), lr=optim_lr,momentum=0.9)
-        scheduler = MultiStepLR(optimizer, milestones=milestones_array, gamma=0.1)
+        optimizer = th.optim.Adadelta(params=model.parameters(),lr=args.lr)
+        scheduler = StepLR(optimizer, step_size = 20, gamma = args.gamma)
+  
       c_epochs=0
-      best_test_acc= 0.0
-      best_model = None
+      best_state_dict = None
       print("Training the model after pruning")
+      best_val_acc = 0
+      best_train_acc = 0
+      best_state_dict = None
+
       for c_epochs in range(200):
+        model.train()
+        train_acc = []
+        total_train_loss = 0.0
 
-          
-          train_acc=[]
-          for batch_num, (inputs, targets) in enumerate(train_loader):
-                    model.train()
-                    optimizer.zero_grad()
-                    if(batch_num==3 and short):
-                      break
-                   
+        for batch_num, (inputs, targets) in enumerate(train_loader):
+          optimizer.zero_grad()
+          inputs, targets = inputs.cuda(), targets.cuda()
+          output = model(inputs)
+          loss = custom_loss(output, targets, model, criterion, lambda_l1=0.00001)
+          loss.backward()
+          optimizer.step()
+          # accumulate train loss
+          total_train_loss += loss.item()
 
+          with torch.no_grad():
+            y_hat = torch.argmax(output, 1)
+            score = torch.eq(y_hat, targets).sum()
+            train_acc.append(score.item())
 
-                    inputs = inputs.cuda()
-                    targets = targets.cuda()
-                    
-                    output = model(inputs)
-                    # loss = criterion(output, targets)+reg
-                    loss = custom_loss(output, targets, model, criterion, lambda_l1=0.01)
-                    # loss = criterion(output, targets)
-                    loss.backward()
-                    optimizer.step()
-                    with th.no_grad():
+        with torch.no_grad():
+          epoch_train_acc = (sum(train_acc) * 100) / tr_size
+          val_loss, val_acc = evaluate(model, val_loader, criterion)
+          epoch_train_loss = total_train_loss / len(train_loader)  
+        
+          if val_acc > best_val_acc:
+              best_val_acc = val_acc
+              best_train_acc = epoch_train_acc
+              best_state_dict = deepcopy(model.state_dict())
 
-                      y_hat = th.argmax(output, 1)
-                      score = th.eq(y_hat, targets).sum()
-                      train_acc.append(score.item())
+          print('\n--- Epoch: {} | Train acc: {:.2f}% | Train loss: {:.4f} | Val acc: {:.2f}% | Val loss: {:.4f}'
+              .format(c_epochs, epoch_train_acc, epoch_train_loss, val_acc, val_loss))
+            
+          scheduler.step()
 
-          with th.no_grad():
+      print(f"Best Validation Accuracy for pruning iteration {pruningTimes} is: ", best_val_acc)
 
-                    epoch_train_acc= (sum(train_acc)*100)/tr_size
-                    test_acc=[]
-                    model.eval()
-                    for batch_nums, (inputs2, targets2) in enumerate(test_loader):
-                        
-                        
-                        if(batch_nums==3 and short):
-                            break
+      model.load_state_dict(best_state_dict)
 
-                        inputs2, targets2 = inputs2.cuda(), targets2.cuda()
+      test_loss, test_acc = evaluate(model, test_loader, criterion)
+      print("Final Test Loss: {:.4f} | Final Test Accuracy: {:.2f}%".format(test_loss, test_acc))
 
-                        output=model(inputs2)
-                        y_hat = th.argmax(output, 1)
-                        score = th.eq(y_hat, targets2).sum()
-                        test_acc.append(score.item())
+      train_loss, train_acc = evaluate(model, train_loader, criterion)
+      val_loss, val_acc     = evaluate(model, val_loader, criterion)
+      param_count = calculate_parameters(model)
+      trainable_param_count = calculate_trainable_parameters(model)
+      new_row = {
+          "Pruning Iteration": pruningTimes,
+          "Train Acc": train_acc,
+          "Val Acc": val_acc,
+          "Test Acc": test_acc,
+          "Train Loss": train_loss,
+          "Val Loss": val_loss,
+          "Test Loss": test_loss,
+          "Param Count": param_count,
+          "Trainable Param Count": trainable_param_count
+      }
 
-                    epoch_test_acc=(sum(test_acc)*100)/te_size
-                    if(epoch_test_acc > best_test_acc ):
-                        best_test_acc=epoch_test_acc
-                        best_train_acc=epoch_train_acc
-                        best_model = model
-                    print('\n---------------Epoch number: {}'.format(c_epochs),
-                      '---Train accuracy: {}'.format(epoch_train_acc),
-                      '----Test accuracy: {}'.format(epoch_test_acc),'--------------')
-                    scheduler.step()
-                    
-      print("Best test acc here is: ", best_test_acc)
-      
-      model = best_model
+      df_existing = pd.read_excel(excel_path)
+      df_existing = pd.concat([df_existing, pd.DataFrame([new_row])], ignore_index=True)
+      df_existing.to_excel(excel_path, index=False)
+
       torch.save(model, f"modelsInitBase2/{pruningTimes}_pruned_model.pth")
-      best_test_acc = 0
-      best_model = None
-      ended_epoch=ended_epoch+c_epochs+1
+
+      ended_epoch += c_epochs + 1
       pruningTimes += 1
 
-def train(model):
-    global pruningTimes
-    best_test_acc= 0.0
-    optimizer = th.optim.SGD(model.parameters(), lr=optim_lr,momentum=0.9)
-    scheduler = MultiStepLR(optimizer, milestones=milestones_array, gamma=0.1)
-      
-    for c_epochs in range(200):
-      train_acc=[]
-      for batch_num, (inputs, targets) in enumerate(train_loader):
-                    model.train()
-                    optimizer.zero_grad()
-                    if(batch_num==3 and short):
-                      break
-                  
-                    inputs = inputs.cuda()
-                    targets = targets.cuda()
-                    
-                    output = model(inputs)
-                    # loss = criterion(output, targets)+reg
-                    loss = custom_loss(output, targets, model, criterion, lambda_l1=0.01)
-                    # loss = criterion(output, targets)
-                    loss.backward()
-                    optimizer.step()
-                    with th.no_grad():
-
-                      y_hat = th.argmax(output, 1)
-                      score = th.eq(y_hat, targets).sum()
-                      train_acc.append(score.item())
-
-      with th.no_grad():
-                    epoch_train_acc= (sum(train_acc)*100)/tr_size
-                    test_acc=[]
-                    model.eval()
-                    for batch_nums, (inputs2, targets2) in enumerate(test_loader):
-                        
-                        
-                        if(batch_nums==3 and short):
-                            break
-
-                        inputs2, targets2 = inputs2.cuda(), targets2.cuda()
-
-                        output=model(inputs2)
-                        y_hat = th.argmax(output, 1)
-                        score = th.eq(y_hat, targets2).sum()
-                        test_acc.append(score.item())
-
-                    epoch_test_acc=(sum(test_acc)*100)/te_size
-                    if(epoch_test_acc > best_test_acc ):
-                        best_test_acc=epoch_test_acc
-                        best_train_acc=epoch_train_acc
-                        best_model = model
-                    print('\n---------------Epoch number: {}'.format(c_epochs),
-                      '---Train accuracy: {}'.format(epoch_train_acc),
-                      '----Test accuracy: {}'.format(epoch_test_acc),'--------------')
-                    scheduler.step()
-                    
-    print("Best test acc here is: ", best_test_acc)
-      
-    model = best_model
-    torch.save(model, f"modelsInitBase2/{pruningTimes}_pruned_model.pth")
-    pruningTimes+=1
 
 if __name__ == "__main__":
+
+  random_seed=42
+  seed = 1787
+  pruningTimes = 1
+
     
   norm_mean, norm_var = 0.0, 1.0
 
@@ -478,7 +428,6 @@ if __name__ == "__main__":
   batch_size_tr = 128
   batch_size_te = 128
 
-  
 
   epochs = 182
   custom_epochs=15
@@ -487,19 +436,13 @@ if __name__ == "__main__":
   milestones_array=[100]
   lamda=0.001
 
-  # prune_limits=[6]*5*3
-  # prune_value=[1]*5+[2]*5+[4]*5
-
-  prune_limits = [1] * 2 * 4 
-  prune_value = [1] * 2 + [2] * 2 + [4] * 2  + [8] * 2  
-
-  # total_layers=32
-  # total_convs=15
-  # total_blocks=3
+ 
+  prune_limits = [1] * 2 * 5 
+  prune_value = [1] * 2  + [2] * 2  + [4] * 2   + [8] * 2   
 
   total_layers = 18 
   total_convs = 8 
-  total_blocks = 4 
+  total_blocks = 5
 
   gpu = th.cuda.is_available()
 
@@ -550,7 +493,8 @@ if __name__ == "__main__":
 
   num_classes = 47
   image_size = 32
-  #Define the data loaders
+  # iteration = 1
+
   transform_train = transforms.Compose(
           [ 
               #transforms.CenterCrop(26),
@@ -572,17 +516,26 @@ if __name__ == "__main__":
   PBG.moduleNamesToConvert.append('BasicBlock')
 
   device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-  #Dataset
-  dataset1 = datasets.EMNIST(root='../.././data', split='balanced', train=True, download=True, transform=transform_train)
-  dataset2 = datasets.EMNIST(root='../.././data',  split='balanced', train=False, download=True, transform=transform_test)
-  train_loader = torch.utils.data.DataLoader(dataset1,**train_kwargs)
-  test_loader = torch.utils.data.DataLoader(dataset2, **test_kwargs)
+
+  dataset1 = datasets.EMNIST(root='.././data', split='balanced', train=True, download=True, transform=transform_train)
+  dataset2 = datasets.EMNIST(root='.././data',  split='balanced', train=False, download=True, transform=transform_test)
+  
+  test_size = len(dataset2)
+  train_size = len(dataset1) - test_size
+  val_size = test_size
+
+  train_subset, val_subset = torch.utils.data.random_split(dataset1, [train_size, val_size])
+
+  train_loader = torch.utils.data.DataLoader(train_subset, **train_kwargs)
+  val_loader   = torch.utils.data.DataLoader(val_subset, **test_kwargs)
+  test_loader  = torch.utils.data.DataLoader(dataset2, **test_kwargs)
+
   total_step = len(train_loader)
 
-  # model = models.resnet18(num_classes == num_classes)
+  model = models.resnet18(num_classes == num_classes)
+  # model = PN.loadPAIModel(model, '25Model.pt')
+#   model = torch.load(f"modelsTrained1_{iteration}/{iteration}_pruned_model.pth", weights_only=False)
     
-  # model = PN.loadPAIModel(model, 'nets/net0.25_6.pt')
-  model = torch.load("modelsInitBase2/3_pruned_model.pth", weights_only=False)
   model = model.to(device)
 
   print(model)
@@ -596,16 +549,27 @@ if __name__ == "__main__":
   activation = 'relu'
 
 
-  optimizer = th.optim.SGD(model.parameters(), lr=0.1,momentum=0.9, weight_decay=2e-4,nesterov=True)
-  scheduler = MultiStepLR(optimizer, milestones=[91,136], gamma=0.1)
+  # optimizer = th.optim.SGD(model.parameters(), lr=0.1,momentum=0.9, weight_decay=2e-4,nesterov=True)
+  # scheduler = MultiStepLR(optimizer, milestones=[91,136], gamma=0.1)
   criterion = nn.CrossEntropyLoss()
+  optimizer = th.optim.Adadelta(params=model.parameters(),lr=args.lr)
+  scheduler = StepLR(optimizer, step_size = 20, gamma= args.gamma)
 
-  
-  #_____________________Conv_layers_________________
+  excel_path = f"training_results1_1base.xlsx"
+
+  if not os.path.exists(excel_path):
+      df_init = pd.DataFrame(columns=[
+          "Pruning Iteration",
+          "Train Acc", "Val Acc", "Test Acc",
+          "Train Loss", "Val Loss", "Test Loss",
+          "Param Count, Trainable Param Count"
+      ])
+      df_init.to_excel(excel_path, index=False)
   a=[]
   for layer_name, layer_module in model.named_modules():
     if(isinstance(layer_module, th.nn.Conv2d) and not layer_name.startswith("conv1") and layer_name.find('conv1')!=-1):
       a.append(layer_module)
+
+  # model = train(model)
+
   main(model)
-
-

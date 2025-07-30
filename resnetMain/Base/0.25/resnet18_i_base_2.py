@@ -437,11 +437,11 @@ if __name__ == "__main__":
   lamda=0.001
 
  
-  prune_limits = [1] * 2 * 5 * 5
-  prune_value = [1] * 2 * 5 + [2] * 2 * 5 + [4] * 2 * 5  + [8] * 2 * 5  
+  prune_limits = [1] * 2 * 5 
+  prune_value = [1] * 2  + [2] * 2  + [4] * 2   + [8] * 2   
 
-  total_layers = 18 * 5
-  total_convs = 8 * 5
+  total_layers = 18 
+  total_convs = 8 
   total_blocks = 5
 
   gpu = th.cuda.is_available()
