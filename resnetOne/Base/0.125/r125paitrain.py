@@ -153,7 +153,7 @@ def evaluate(model, device, valid_loader, optimizer, scheduler, args):
     model.to(device)
     if(restructured):
         optimArgs = {'params':model.parameters(),'lr':args.lr}
-        schedArgs = {'step_size':1, 'gamma': args.gamma}
+        schedArgs = {'step_size':20, 'gamma': args.gamma}
         optimizer, scheduler = PBG.pbTracker.setupOptimizer(model, optimArgs, schedArgs)
     val_accuracy = 100. * correct / len(valid_loader.dataset)
     return val_loss, val_accuracy, model, optimizer, scheduler, trainingComplete

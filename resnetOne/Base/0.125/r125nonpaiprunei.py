@@ -10,7 +10,7 @@ import torch.optim as optim
 from torchvision import datasets, transforms
 import resnet as models
 from torch.optim.lr_scheduler import StepLR
-
+from copy import deepcopy
 from perforatedai import pb_globals as PBG
 from perforatedai import pb_models as PBM
 from perforatedai import pb_utils as PBU
@@ -86,7 +86,7 @@ def custom_loss(outputs, labels, model, lambda_l1=0.00001):
 
 def calculate_parameters(model):
     total_params = 0
-    for param in model.parabbbhmeters():
+    for param in model.parameters():
         total_params += param.numel()
     return total_params
 
@@ -107,7 +107,7 @@ def train(args, model, device, train_loader, optimizer):
         total_train_loss += loss.item()
         pred = output.argmax(dim=1, keepdim=True)
         correct += pred.eq(target.view_as(pred)).sum()
-
+    total_train_loss /= len(train_loader.dataset)
     # PBG.pbTracker.addExtraScore(100. * correct / len(train_loader.dataset), 'train')
     train_acc = 100. * correct / len(train_loader.dataset)
     model.to(device)
@@ -292,7 +292,7 @@ def main():
     optimizer = th.optim.Adadelta(params=model.parameters(),lr=args.lr)
     scheduler = StepLR(optimizer, step_size = 20, gamma= args.gamma)
 
-    excel_path = f"train_results_r125_pai_pruned_pretrain.xlsx"
+    excel_path = f"train_results_r125_nonpai_pruned_init.xlsx"
 
     if not os.path.exists(excel_path):
         df_init = pd.DataFrame(columns=[
@@ -410,8 +410,8 @@ def main():
                 train_loss_val, train_acc_val = train(args, model, device, train_loader, optimizer)
                 test_loss_val, test_acc_val = test(model, device, test_loader, optimizer, scheduler, args)
                 val_loss_val, val_acc_val, model, optimizer, scheduler = evaluate(model, device, val_loader, optimizer, scheduler, args)
-                if trainingComplete:
-                    break
+                # if trainingComplete:
+                #     break
                 scheduler.step()
 
                 if val_acc_val > best_val_acc:
@@ -423,7 +423,7 @@ def main():
 
             print(f"Best Validation Accuracy for pruning iteration {pruningTimes} is: ", best_val_acc)
             model.load_state_dict(best_state_dict)
-            train_loss_val, train_acc_val = train(args, model, device, train_loader, optimizer, epoch, train_acc, total_train_loss)
+            train_loss_val, train_acc_val = train(args, model, device, train_loader, optimizer)
             test_loss_val, test_acc_val = test(model, device, test_loader, optimizer, scheduler, args)
             val_loss_val, val_acc_val, model, optimizer, scheduler = evaluate(model, device, val_loader, optimizer, scheduler, args)
             param_count = calculate_parameters(model)
@@ -445,7 +445,7 @@ def main():
             df_existing = pd.concat([df_existing, pd.DataFrame([new_row])], ignore_index=True)
             df_existing.to_excel(excel_path, index=False)
 
-            torch.save(model, f"models125PAIPrunePretrain/{pruningTimes}_pruned_model.pth")
+            torch.save(model, f"models125NonPAIPruneInit/{pruningTimes}_pruned_model.pth")
             pruningTimes += 1
             # exit(1)
 
