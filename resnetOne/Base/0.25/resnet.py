@@ -204,7 +204,7 @@ class ResNet(nn.Module):
         self.relu = nn.ReLU(inplace=True)
         
         #This is the width parameter that must be changed
-        width = 0.125
+        width = 0.25
         
         self.maxpool = nn.MaxPool2d(kernel_size=3, stride=2, padding=1)
         self.layer1 = self._make_layer(block, int(width*64), layers[0])
