@@ -194,12 +194,14 @@ def main():
 
     N = 1
 
-    prune_limits = [1] * 2 * 5
-    prune_value = [1] * 2  + [2] * 2  + [4] * 2   + [8] * 2
+    dendrites = 3
+    prune_limits = [1] * 2 * 5 * dendrites
+    prune_value = [1] * 2 * dendrites + [2] * 2 * dendrites + [4] * 2 * dendrites  + [8] * 2 * dendrites
 
-    total_layers = 18
-    total_convs = 8
+    total_layers = 18 * dendrites
+    total_convs = 8 * dendrites
     total_blocks = 5
+
 
     th.manual_seed(args.seed)
     th.cuda.manual_seed(args.seed)
@@ -292,7 +294,7 @@ def main():
     optimizer = th.optim.Adadelta(params=model.parameters(),lr=args.lr)
     scheduler = StepLR(optimizer, step_size = 20, gamma= args.gamma)
 
-    excel_path = f"train_results_r125_pai_pruned_pretrain.xlsx"
+    excel_path = f"results1PAIGDPrunePretrain.xlsx"
 
     if not os.path.exists(excel_path):
         df_init = pd.DataFrame(columns=[
@@ -313,6 +315,32 @@ def main():
     decision=True
     best_test_acc= 0.0
     continue_pruning=True
+
+    train_loss_val, train_acc_val = train(args, model, device, train_loader, optimizer)
+    test_loss_val, test_acc_val = test(model, device, test_loader, optimizer, scheduler, args)
+    val_loss_val, val_acc_val, model, optimizer, scheduler = evaluate(model, device, val_loader, optimizer, scheduler, args)
+
+    param_count = calculate_parameters(model)
+
+    print("Final Test Loss: {:.4f} | Final Test Accuracy: {:.2f}% | Params: {:.2f}".format(test_loss_val, test_acc_val, param_count))
+    
+    new_row = {
+    "Pruning Iteration": pruningTimes,
+    "Train Acc": train_acc_val,
+    "Val Acc": val_acc_val,
+    "Test Acc": test_acc_val,
+    "Train Loss": train_loss_val,
+    "Val Loss": val_loss_val,
+    "Test Loss": test_loss_val,
+    "Param Count": param_count
+    }
+    
+    df_existing = pd.read_excel(excel_path)
+    df_existing = pd.concat([df_existing, pd.DataFrame([new_row])], ignore_index=True)
+    df_existing.to_excel(excel_path, index=False)
+    torch.save(model, f"models1PAIGDPrunePretrain/{pruningTimes}_pruned_model.pth")
+    pruningTimes += 1
+     
     while(continue_pruning==True):
 
         if(continue_pruning==True):
@@ -445,7 +473,7 @@ def main():
             df_existing = pd.concat([df_existing, pd.DataFrame([new_row])], ignore_index=True)
             df_existing.to_excel(excel_path, index=False)
 
-            torch.save(model, f"models125PAIPrunePretrain/{pruningTimes}_pruned_model.pth")
+            torch.save(model, f"models1PAIPrunePretrain/{pruningTimes}_pruned_model.pth")
             pruningTimes += 1
             # exit(1)
 
